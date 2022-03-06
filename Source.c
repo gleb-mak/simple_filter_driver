@@ -3,8 +3,20 @@
 
 #define MAX_VALUE 65535
 
-PDEVICE_OBJECT myKbdDevice = NULL;
 ULONG IrpCount = 0;
+
+extern POBJECT_TYPE* IoDriverObjectType;
+
+ObReferenceObjectByName(
+	__in PUNICODE_STRING ObjectName,
+	__in ULONG Attributes,
+	__in_opt PACCESS_STATE AccessState,
+	__in_opt ACCESS_MASK DesiredAccess,
+	__in POBJECT_TYPE ObjectType,
+	__in KPROCESSOR_MODE AccessMode,
+	__inout_opt PVOID ParseContext,
+	__out PVOID* Object
+);
 
 /*
 typedef struct _MOUSE_INPUT_DATA {
@@ -25,7 +37,7 @@ typedef struct _MOUSE_INPUT_DATA {
 */
 
 typedef struct {
-	PDEVICE_OBJECT attachedKbdDEvice;
+	PDEVICE_OBJECT attachedDEvice;
 	USHORT Flag;
 	USHORT IsInversion;
 } DEVICE_EXTENSION, *PDEVICE_EXTENSION;
@@ -44,11 +56,18 @@ VOID Unload(PDRIVER_OBJECT DriverObject) {
 	PDEVICE_OBJECT DeviceObject = DriverObject->DeviceObject;
 	LARGE_INTEGER delay = { 0 };
 	delay.QuadPart = -10 * 1000 * 1000;
-	IoDetachDevice(((PDEVICE_EXTENSION)DeviceObject->DeviceExtension)->attachedKbdDEvice);
+	while (DeviceObject) {
+		IoDetachDevice(((PDEVICE_EXTENSION)DeviceObject->DeviceExtension)->attachedDEvice);
+		DeviceObject = DeviceObject->NextDevice;
+	}
 	while (IrpCount) {
 		KeDelayExecutionThread(KernelMode, FALSE, &delay);
 	}
-	IoDeleteDevice(DeviceObject);
+	DeviceObject = DriverObject->DeviceObject;
+	while (DeviceObject) {
+		IoDeleteDevice(DeviceObject);
+		DeviceObject = DeviceObject->NextDevice;
+	}
 	KdPrint(("driver unload\n"));
 }
 
@@ -103,37 +122,51 @@ NTSTATUS ReadComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context) {
 
 NTSTATUS DispatchPass(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 	IoCopyCurrentIrpStackLocationToNext(Irp);
-	return IoCallDriver(((PDEVICE_EXTENSION)DeviceObject->DeviceExtension)->attachedKbdDEvice, Irp);
+	return IoCallDriver(((PDEVICE_EXTENSION)DeviceObject->DeviceExtension)->attachedDEvice, Irp);
 }
 
 NTSTATUS DispatchRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 	IoCopyCurrentIrpStackLocationToNext(Irp);
 	IoSetCompletionRoutine(Irp, ReadComplete, NULL, TRUE, TRUE, TRUE);
 	IrpCount++;
-	return IoCallDriver(((PDEVICE_EXTENSION)DeviceObject->DeviceExtension)->attachedKbdDEvice, Irp);
+	return IoCallDriver(((PDEVICE_EXTENSION)DeviceObject->DeviceExtension)->attachedDEvice, Irp);
 }
 
 NTSTATUS MyAttachDevice(PDRIVER_OBJECT DriverObject) {
 	NTSTATUS status = STATUS_SUCCESS;
-	UNICODE_STRING TargetDevice = RTL_CONSTANT_STRING(L"\\Device\\PointerClass0");
+	UNICODE_STRING MouseClassName = RTL_CONSTANT_STRING(L"\\Driver\\Mouclass");
+	PDRIVER_OBJECT MouseClassDriver = NULL;
+	PDEVICE_OBJECT CurrentDevice = NULL;
+	PDEVICE_OBJECT myDeviceObject = NULL;
 
-	status = IoCreateDevice(DriverObject, sizeof(DEVICE_EXTENSION), NULL, FILE_DEVICE_KEYBOARD, 0, FALSE, &myKbdDevice);
+	status = ObReferenceObjectByName(&MouseClassName, OBJ_CASE_INSENSITIVE, NULL, 0, *IoDriverObjectType, KernelMode, NULL, (PVOID*)&MouseClassDriver);
 	if (!NT_SUCCESS(status)) {
-		KdPrint(("IoCreateDevice failed"));
+		KdPrint(("ObReferenceObjectByName failed\n"));
 		return status;
 	}
-	RtlZeroMemory(myKbdDevice->DeviceExtension, sizeof(DEVICE_EXTENSION));
-	status = IoAttachDevice(myKbdDevice, &TargetDevice, &((PDEVICE_EXTENSION)myKbdDevice->DeviceExtension)->attachedKbdDEvice);
-	if (!NT_SUCCESS(status)) {
-		KdPrint(("IoAttachDeviceToDeviceStack failed\n"));
-		IoDeleteDevice(myKbdDevice);
-		return status;
+	ObDereferenceObject(MouseClassDriver);
+	CurrentDevice = MouseClassDriver->DeviceObject;
+	while (CurrentDevice) {
+		status = IoCreateDevice(DriverObject, sizeof(DEVICE_EXTENSION), NULL, FILE_DEVICE_MOUSE, 0, FALSE, &myDeviceObject);
+		if (!NT_SUCCESS(status)) {
+			KdPrint(("IoCreateDevice failed"));
+			return status;
+		}
+		RtlZeroMemory(myDeviceObject->DeviceExtension, sizeof(DEVICE_EXTENSION));
+		status = IoAttachDeviceToDeviceStackSafe(myDeviceObject, MouseClassDriver->DeviceObject, &((PDEVICE_EXTENSION)myDeviceObject->DeviceExtension)->attachedDEvice);
+		if (!NT_SUCCESS(status)) {
+			KdPrint(("IoAttachDeviceToDeviceStack failed\n"));
+			IoDeleteDevice(myDeviceObject);
+			return status;
+		}
+		myDeviceObject->Flags |= (((PDEVICE_EXTENSION)myDeviceObject->DeviceExtension)->attachedDEvice)->Flags & (DO_BUFFERED_IO | \
+			DO_DIRECT_IO);
+		myDeviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
+		myDeviceObject->Flags |= DO_POWER_PAGABLE;
+		myDeviceObject->DeviceType = (((PDEVICE_EXTENSION)myDeviceObject->DeviceExtension)->attachedDEvice)->DeviceType;
+		CurrentDevice = CurrentDevice->NextDevice;
 	}
-	myKbdDevice->Flags |= (((PDEVICE_EXTENSION)myKbdDevice->DeviceExtension)->attachedKbdDEvice)->Flags & (DO_BUFFERED_IO | \
-		DO_DIRECT_IO);
-	myKbdDevice->Flags &= ~DO_DEVICE_INITIALIZING;
-	myKbdDevice->Flags |= DO_POWER_PAGABLE;
-	myKbdDevice->DeviceType = (((PDEVICE_EXTENSION)myKbdDevice->DeviceExtension)->attachedKbdDEvice)->DeviceType;
+	
 	return STATUS_SUCCESS;
 }
 
